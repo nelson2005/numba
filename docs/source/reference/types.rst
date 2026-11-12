@@ -193,6 +193,15 @@ Automatic overload         yes            no               no
 \* at least one of the items in a sequence of first-class function objects must
 have a precise type.
 
+A :term:`JIT` compiled function passed where a ``types.FunctionType`` with a
+declared signature is expected is compiled for the argument types of that
+signature. If the function returns a different type, its result is converted
+to the declared return type, as a ``return`` statement converts a value, and
+an error is raised if no such conversion exists. The function keeps its own
+return type for every other caller. When the other arguments match equally
+well, overload resolution prefers a ``types.FunctionType`` signature whose
+return type matches the function's own over one that needs the conversion.
+
 
 Wrapper Address Protocol - WAP
 ++++++++++++++++++++++++++++++

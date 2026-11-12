@@ -575,11 +575,17 @@ class Dispatcher(WeakType, Callable, Dummy):
     def can_convert_to(self, typingctx, other):
         if isinstance(other, types.FunctionType):
             try:
-                self.dispatcher.get_compile_result(other.signature)
+                cres = self.dispatcher.get_compile_result(other.signature)
             except errors.NumbaError:
                 return None
-            else:
-                return Conversion.safe
+            overload = self.dispatcher.overloads.get(
+                tuple(other.signature.args))
+            # A target that the overload matches ranks above one that needs
+            # a return adapter. Both ranks stay within safe, which other
+            # checks require of a first-class function argument.
+            if cres is overload:
+                return Conversion.promote
+            return Conversion.safe
 
 
 class ObjModeDispatcher(Dispatcher):

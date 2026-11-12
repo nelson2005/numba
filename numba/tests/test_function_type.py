@@ -1,9 +1,13 @@
+import gc
 import re
 import sys
+import threading
 import unittest
 import types as pytypes
+import weakref
 from numba import jit, njit, cfunc, types, int64, float64, float32, errors
 from numba import literal_unroll, typeof
+from numba.core.compiler_lock import global_compiler_lock
 from numba.core.config import IS_WIN32
 import ctypes
 import warnings
@@ -1445,8 +1449,10 @@ class TestFunctionTypeReturnMismatch(TestCase):
             return len(r), r == "hello", r == ""
 
         self.assertEqual(probe(gm), (5, True, False))
+        # The callee keeps its inferred return type
         self.assertEqual(list(gm.nopython_signatures),
-                         [types.unicode_type()])
+                         [types.literal("hello")()])
+        self.assertEqual(gm(), "hello")
 
     def test_literal_int_vs_float64(self):
         @jit
@@ -1458,11 +1464,12 @@ class TestFunctionTypeReturnMismatch(TestCase):
             return fn()
 
         self.assertEqual(probe(gm), 7.0)
-        self.assertEqual(list(gm.nopython_signatures), [float64()])
+        # The callee keeps its inferred return type
+        self.assertEqual(list(gm.nopython_signatures), [types.literal(7)()])
+        self.assertPreciseEqual(gm(), 7)
 
-    def test_preexisting_literal_str_mismatch(self):
-        # Pre-existing () -> Literal[str] overload is keyed by args only,
-        # so compile(sig) does not replace it, mismatch must raise.
+    def test_preexisting_literal_str(self):
+        # A pre-existing () -> Literal[str] overload is converted as well
         @jit
         def gm():
             return "hello"
@@ -1474,9 +1481,244 @@ class TestFunctionTypeReturnMismatch(TestCase):
             r = fn()
             return len(r), r == "hello", r == ""
 
-        with self.assertRaises(TypeError) as raises:
-            probe(gm)
-        self.assertIn("mismatch of return type", str(raises.exception))
+        self.assertEqual(probe(gm), (5, True, False))
+        self.assertEqual(gm(), "hello")
+
+    def test_callee_keeps_return_type(self):
+        # A declared return type converts the value for that caller only.
+        # The callee serves every other caller with its inferred type, in
+        # either order of first use.
+        big = 2 ** 53
+
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        @jit((types.FunctionType(int64(int64)), int64))
+        def as_int64(fn, x):
+            return fn(x)
+
+        for first, second in [(as_float64, as_int64),
+                              (as_int64, as_float64)]:
+            with self.subTest(first=first.py_func.__name__):
+                @jit
+                def gm(x):
+                    return x + 1
+
+                expected = {as_float64: float(big + 1), as_int64: big + 1}
+                self.assertPreciseEqual(first(gm, big), expected[first])
+                self.assertPreciseEqual(gm(big), big + 1)
+                self.assertPreciseEqual(second(gm, big), expected[second])
+                self.assertEqual(list(gm.nopython_signatures),
+                                 [int64(int64)])
+                self.assertPreciseEqual(gm(big), big + 1)
+
+    def test_direct_call_and_declared_return(self):
+        # One caller links the callee and an adapter for it
+        @jit
+        def gm(x):
+            return x + 1
+
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        @jit
+        def both(x):
+            return gm(x), as_float64(gm, x)
+
+        self.assertPreciseEqual(both(2 ** 53), (2 ** 53 + 1, float(2 ** 53)))
+
+    def test_compilation_disabled(self):
+        @jit(int64(int64))
+        def gm(x):
+            return x + 1
+
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        self.assertPreciseEqual(as_float64(gm, 1), 2.0)
+        self.assertEqual(list(gm.nopython_signatures), [int64(int64)])
+
+    def test_unconvertible_return(self):
+        @jit
+        def gm(x):
+            return x + 1
+
+        @jit((types.FunctionType(types.unicode_type(int64)), int64))
+        def as_str(fn, x):
+            return fn(x)
+
+        for warm in (False, True):
+            with self.subTest(warm=warm):
+                with self.assertRaises(TypeError) as raises:
+                    as_str(gm, 1)
+                self.assertIn("mismatch of return type: int64 vs "
+                              "unicode_type", str(raises.exception))
+                self.assertPreciseEqual(gm(1), 2)
+
+    def test_overload_prefers_matching_return(self):
+        big = 2 ** 53 + 2
+
+        @jit([float64(types.FunctionType(float64(int64)), int64),
+              int64(types.FunctionType(int64(int64)), int64)])
+        def call(fn, x):
+            return fn(x)
+
+        for warm in (False, True):
+            with self.subTest(warm=warm):
+                @jit
+                def gm(x):
+                    return x + 1
+
+                @jit
+                def outer(x):
+                    return call(gm, x)
+
+                if warm:
+                    gm(1)
+                self.assertPreciseEqual(call(gm, big), big + 1)
+                self.assertPreciseEqual(outer(big), big + 1)
+
+    def test_adapter_entry_point(self):
+        @jit
+        def gm(x):
+            if x < 0:
+                raise ValueError("negative")
+            return x + 1
+
+        gm(1)
+        cres = gm.get_compile_result(float64(int64))
+        self.assertEqual(cres.signature, float64(int64))
+        self.assertPreciseEqual(cres.entry_point(1), 2.0)
+        with self.assertRaises(ValueError) as raises:
+            cres.entry_point(-1)
+        self.assertEqual(str(raises.exception), "negative")
+
+    def test_literal_return_prefers_matching(self):
+        @jit
+        def gm():
+            return 7
+
+        @jit([float64(types.FunctionType(float64())),
+              int64(types.FunctionType(int64()))])
+        def call(fn):
+            return fn()
+
+        self.assertPreciseEqual(call(gm), 7)
+
+    def test_adapter_through_first_class_call(self):
+        @jit
+        def gm(x):
+            return x + 1
+
+        inner = types.FunctionType(float64(int64))
+
+        @jit((inner, int64))
+        def apply(fn, x):
+            return fn(x)
+
+        @jit((types.FunctionType(float64(inner, int64)), int64))
+        def higher(h, x):
+            return h(gm, x)
+
+        self.assertPreciseEqual(higher(apply, 3), 4.0)
+
+    def test_adapter_in_dict_literal(self):
+        @jit
+        def gm(x):
+            return x + 1
+
+        @jit
+        def gf(x):
+            return x + 0.5
+
+        @jit((types.FunctionType(float64(int64)), types.unicode_type, int64))
+        def pick(fn, key, x):
+            d = {'a': fn, 'b': gm}
+            return d[key](x)
+
+        self.assertPreciseEqual(pick(gf, 'a', 3), 3.5)
+        self.assertPreciseEqual(pick(gf, 'b', 3), 4.0)
+
+    def test_recompile_drops_adapters(self):
+        k = 1
+
+        @jit
+        def gm(x):
+            return x + k
+
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        self.assertPreciseEqual(as_float64(gm, 1), 2.0)
+        k = 10
+        gm.recompile()
+        self.assertPreciseEqual(gm(1), 11)
+        self.assertPreciseEqual(as_float64(gm, 1), 11.0)
+
+    def test_finalizer_removes_adapters(self):
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        def make():
+            @jit
+            def gm(x):
+                return x + 1
+            return gm
+
+        self.assertPreciseEqual(as_float64(make(), 1), 2.0)
+        gc.collect()
+        defns = as_float64.targetctx._defns
+        before = len(defns)
+        gm = make()
+        self.assertPreciseEqual(as_float64(gm, 1), 2.0)
+        self.assertGreater(len(defns), before)
+        ref = weakref.ref(gm)
+        del gm
+        gc.collect()
+        self.assertIsNone(ref())
+        self.assertEqual(len(defns), before)
+
+    def test_adapter_lookup_without_compiler_lock(self):
+        @jit
+        def gm(x):
+            return x + 1
+
+        sig = float64(int64)
+        cres = gm.get_compile_result(sig)
+        found = []
+        thread = threading.Thread(
+            target=lambda: found.append(gm.get_compile_result(sig)))
+        with global_compiler_lock:
+            thread.start()
+            thread.join(timeout=60)
+            waited = thread.is_alive()
+        thread.join()
+        self.assertFalse(waited)
+        self.assertIs(found[0], cres)
+
+    def test_no_cfunc_wrapper(self):
+        @jit(no_cfunc_wrapper=True)
+        def gm(x):
+            return x + 1
+
+        @jit((types.FunctionType(int64(int64)), int64))
+        def as_int64(fn, x):
+            return fn(x)
+
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        for caller in (as_int64, as_float64):
+            with self.subTest(caller=caller.py_func.__name__):
+                with self.assertRaises(ValueError) as raises:
+                    caller(gm, 1)
+                self.assertIn("wrapper address", str(raises.exception))
 
 
 if __name__ == '__main__':
