@@ -1596,6 +1596,26 @@ class TestFunctionTypeReturnMismatch(TestCase):
                 self.assertPreciseEqual(call(gm, big), big + 1)
                 self.assertPreciseEqual(outer(big), big + 1)
 
+    def test_overload_prefers_matching_return_after_adapter(self):
+        big = 2 ** 53 + 2
+
+        @jit
+        def gm(x):
+            return x + 1
+
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        @jit([float64(types.FunctionType(float64(int64)), int64),
+              int64(types.FunctionType(int64(int64)), int64)])
+        def call(fn, x):
+            return fn(x)
+
+        # This call ranks only the target that needs an adapter
+        self.assertPreciseEqual(as_float64(gm, 1), 2.0)
+        self.assertPreciseEqual(call(gm, big), big + 1)
+
     def test_adapter_entry_point(self):
         @jit
         def gm(x):

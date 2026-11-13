@@ -585,6 +585,16 @@ class Dispatcher(WeakType, Callable, Dummy):
             # checks require of a first-class function argument.
             if cres is overload:
                 return Conversion.promote
+            # The C dispatcher asks for new conversions only when no signature
+            # matches. Also rank the target that the overload matches, so that
+            # a signature with that target is preferred.
+            matching = types.FunctionType(overload.signature)
+            tm = typingctx.tm
+            if (matching != other and
+                    tm.check_compatible(self, matching) is None):
+                conv = self.can_convert_to(typingctx, matching)
+                if conv is not None:
+                    tm.set_compatible(self, matching, conv)
             return Conversion.safe
 
 
