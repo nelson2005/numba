@@ -203,6 +203,10 @@ class _DispatcherBase(_dispatcher.Dispatcher):
         # A mapping of (args, return_type) to the compile results of the
         # adapters made by get_compile_result(). They are not overloads.
         self._return_adapters = {}
+        # The (args, return_type) pairs requested from get_compile_result().
+        # recompile() ranks the first-class function type for each pair
+        # again.
+        self._declared_signatures = set()
 
         self.py_func = py_func
         # other parts of Numba assume the old Python 2 name for code object
@@ -935,11 +939,12 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
         """Compile (if needed) and return the compilation result with the
         given signature.
 
-        The overload for the argument types of *sig* is returned when it has
-        the return type of *sig*. Otherwise the result is an adapter with
-        the signature *sig*. The adapter calls that overload and converts
-        the return value. The overload itself is compiled from the argument
-        types alone and is never replaced.
+        The overload for the argument types of *sig* is returned when its
+        return type is the return type of *sig*, or is a literal type of
+        that type with the same LLVM value type. Otherwise the result is an
+        adapter with the signature *sig*. The adapter calls that overload
+        and converts the return value. The overload itself is compiled from
+        the argument types alone and is never replaced.
 
         Returns ``CompileResult``.
         Raises ``NumbaError`` if the signature is incompatible.
@@ -955,6 +960,7 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
         _, return_type = sigutils.normalize_signature(sig)
         if return_type is None or not return_type.is_precise():
             return cres
+        self._declared_signatures.add((atypes, return_type))
         actual = cres.signature.return_type
         if actual == return_type:
             return cres
@@ -978,7 +984,9 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
         value.
 
         Adapters are kept apart from ``self.overloads``: they take no part
-        in dispatch and are not saved to the on-disk cache.
+        in dispatch and are not saved to the on-disk cache. An adapter does
+        not add a new signature, so it is compiled even when
+        ``disable_compile`` has disabled the compilation of new signatures.
 
         Raises ``TypingError`` if the return type cannot be converted.
         """
@@ -1040,6 +1048,17 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
                 self.compile(sig)
         finally:
             self._can_compile = old_can_compile
+        # The type manager caches the rank of this dispatcher for each
+        # first-class function type. The rank depends on the return type of
+        # an overload, which may have changed.
+        typ = types.Dispatcher(self)
+        tm = self.typingctx.tm
+        for args, return_type in list(self._declared_signatures):
+            target = types.FunctionType(return_type(*args))
+            if tm.check_compatible(typ, target) is not None:
+                conv = typ.can_convert_to(self.typingctx, target)
+                if conv is not None:
+                    tm.set_compatible(typ, target, conv)
 
     @property
     def stats(self):

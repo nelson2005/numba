@@ -1541,6 +1541,21 @@ class TestFunctionTypeReturnMismatch(TestCase):
         self.assertPreciseEqual(as_float64(gm, 1), 2.0)
         self.assertEqual(list(gm.nopython_signatures), [int64(int64)])
 
+    def test_compilation_disabled_other_arguments(self):
+        @jit(int64(int64))
+        def gm(x):
+            return x + 1
+
+        @jit((types.FunctionType(float64(float64)), float64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        with self.assertRaises(TypeError) as raises:
+            as_float64(gm, 1.0)
+        self.assertIn("not available and compilation disabled",
+                      str(raises.exception))
+        self.assertEqual(list(gm.nopython_signatures), [int64(int64)])
+
     def test_unconvertible_return(self):
         @jit
         def gm(x):
@@ -1658,6 +1673,30 @@ class TestFunctionTypeReturnMismatch(TestCase):
         gm.recompile()
         self.assertPreciseEqual(gm(1), 11)
         self.assertPreciseEqual(as_float64(gm, 1), 11.0)
+
+    def test_recompile_changes_return_type(self):
+        k = 1
+
+        @jit
+        def gm(x):
+            return x + k
+
+        @jit([float64(types.FunctionType(float64(int64)), int64),
+              int64(types.FunctionType(int64(int64)), int64)])
+        def call(fn, x):
+            return fn(x)
+
+        self.assertPreciseEqual(call(gm, 2), 3)
+        k = 0.5
+        gm.recompile()
+
+        @jit
+        def outer(x):
+            return call(gm, x)
+
+        # Overload resolution prefers the matching return type again
+        self.assertPreciseEqual(call(gm, 2), 2.5)
+        self.assertPreciseEqual(outer(2), 2.5)
 
     def test_finalizer_removes_adapters(self):
         @jit((types.FunctionType(float64(int64)), int64))
