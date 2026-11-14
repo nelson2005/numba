@@ -200,6 +200,13 @@ class _DispatcherBase(_dispatcher.Dispatcher):
 
         # A mapping of signatures to compile results
         self.overloads = collections.OrderedDict()
+        # A mapping of (args, return_type) to the compile results of the
+        # adapters made by get_compile_result(). They are not overloads.
+        self._return_adapters = {}
+        # The (args, return_type) pairs requested from get_compile_result().
+        # recompile() ranks the first-class function type for each pair
+        # again.
+        self._declared_signatures = set()
 
         self.py_func = py_func
         # other parts of Numba assume the old Python 2 name for code object
@@ -245,6 +252,7 @@ class _DispatcherBase(_dispatcher.Dispatcher):
     def _reset_overloads(self):
         self._clear()
         self.overloads.clear()
+        self._return_adapters.clear()
 
     def _make_finalizer(self):
         """
@@ -252,6 +260,7 @@ class _DispatcherBase(_dispatcher.Dispatcher):
         related compiled functions.
         """
         overloads = self.overloads
+        adapters = self._return_adapters
         targetctx = self.targetctx
 
         # Early-bind utils.shutting_down() into the function's local namespace
@@ -263,7 +272,7 @@ class _DispatcherBase(_dispatcher.Dispatcher):
                 return
             # This function must *not* hold any reference to self:
             # we take care to bind the necessary objects in the closure.
-            for cres in overloads.values():
+            for cres in [*overloads.values(), *adapters.values()]:
                 try:
                     targetctx.remove_user_function(cres.entry_point)
                 except KeyError:
@@ -930,33 +939,97 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
         """Compile (if needed) and return the compilation result with the
         given signature.
 
+        The overload for the argument types of *sig* is returned when its
+        return type is the return type of *sig*, or is a literal type of
+        that type with the same LLVM value type. Otherwise the result is an
+        adapter with the signature *sig*. The adapter calls that overload
+        and converts the return value. The overload itself is compiled from
+        the argument types alone and is never replaced.
+
         Returns ``CompileResult``.
         Raises ``NumbaError`` if the signature is incompatible.
         """
         atypes = tuple(sig.args)
         if atypes not in self.overloads:
             if self._can_compile:
-                # Pass the full signature so a declared return type (e.g. from
-                # FunctionType) seeds compilation instead of inferring a
-                # Literal return (see
-                # https://github.com/numba/numba/issues/10755).
-                self.compile(sig)
+                self.compile(atypes)
             else:
                 msg = f"{sig} not available and compilation disabled"
                 raise errors.TypingError(msg)
         cres = self.overloads[atypes]
-        # Overloads are keyed by args only, so a pre-existing overload may
-        # still have a mismatched return. Reject when LLVM value types
-        # differ (no cast is inserted at the FunctionType call).
         _, return_type = sigutils.normalize_signature(sig)
-        if return_type is not None and return_type.is_precise():
-            actual = cres.signature.return_type
-            if (self.targetctx.get_value_type(actual) !=
-                    self.targetctx.get_value_type(return_type)):
-                msg = (f"mismatch of return type: {actual} "
-                       f"vs {return_type}")
-                raise errors.TypingError(msg)
-        return cres
+        if return_type is None or not return_type.is_precise():
+            return cres
+        self._declared_signatures.add((atypes, return_type))
+        actual = cres.signature.return_type
+        if actual == return_type:
+            return cres
+        # FunctionType unliterals its signature. An inferred Literal return
+        # type matches when it has the same LLVM value type as the
+        # unliteral return type.
+        if (types.unliteral(actual) == return_type and
+                self.targetctx.get_value_type(actual) ==
+                self.targetctx.get_value_type(return_type)):
+            return cres
+        # Overloads are keyed by argument types alone, so a second overload
+        # with the declared return type cannot be registered. Convert the
+        # return value in an adapter instead (see
+        # https://github.com/numba/numba/issues/10755).
+        return self._get_return_adapter(atypes, return_type)
+
+    def _get_return_adapter(self, args, return_type):
+        """Return the compilation result of an adapter with the signature
+        ``return_type(*args)``. The adapter calls the overload for *args*
+        and converts its result the way a ``return`` statement converts a
+        value.
+
+        Adapters are kept apart from ``self.overloads``: they take no part
+        in dispatch and are not saved to the on-disk cache. An adapter does
+        not add a new signature, so it is compiled even when
+        ``disable_compile`` has disabled the compilation of new signatures.
+
+        Raises ``TypingError`` if the return type cannot be converted.
+        """
+        key = args, return_type
+        cres = self._return_adapters.get(key)
+        if cres is not None:
+            return cres
+        with global_compiler_lock:
+            cres = self._return_adapters.get(key)
+            if cres is not None:
+                return cres
+            names = ', '.join(f'arg{i}' for i in range(len(args)))
+            glbls = {'callee': self}
+            exec(f'def adapter({names}):\n    return callee({names})\n',
+                 glbls)
+            adapter = glbls['adapter']
+            adapter.__module__ = self.py_func.__module__
+            # The symbol name is derived from the qualified name. Including
+            # the return type keeps two adapters of one overload apart, even
+            # when a copy of one comes from the on-disk cache of a caller.
+            adapter.__qualname__ = (f'{self.py_func.__qualname__}.'
+                                    f'<adapter {return_type}>')
+            flags = compiler.Flags()
+            flags.nrt = True
+            flags.no_cfunc_wrapper = self.targetoptions.get(
+                'no_cfunc_wrapper', False)
+            try:
+                cres = compiler.compile_extra(self.typingctx, self.targetctx,
+                                              adapter, args=args,
+                                              return_type=return_type,
+                                              flags=flags, locals={})
+            except errors.TypingError as e:
+                # The adapter is a call plus a cast; only the cast can fail
+                actual = self.overloads[args].signature.return_type
+                msg = f"mismatch of return type: {actual} vs {return_type}"
+                raise errors.TypingError(msg) from e
+            # The IR and the globals of the adapter refer to this
+            # dispatcher. Drop them: the finalizer holds the adapters, so a
+            # reference back would keep the dispatcher alive.
+            glbls.clear()
+            cres = cres._replace(type_annotation=None)
+            self._return_adapters[key] = cres
+            return cres
 
     def recompile(self):
         """
@@ -975,6 +1048,17 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
                 self.compile(sig)
         finally:
             self._can_compile = old_can_compile
+        # The type manager caches the rank of this dispatcher for each
+        # first-class function type. The rank depends on the return type of
+        # an overload, which may have changed.
+        typ = types.Dispatcher(self)
+        tm = self.typingctx.tm
+        for args, return_type in list(self._declared_signatures):
+            target = types.FunctionType(return_type(*args))
+            if tm.check_compatible(typ, target) is not None:
+                conv = typ.can_convert_to(self.typingctx, target)
+                if conv is not None:
+                    tm.set_compatible(typ, target, conv)
 
     @property
     def stats(self):

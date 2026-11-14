@@ -1,0 +1,12 @@
+Keep a function's return type when it is passed as a first-class function
+-------------------------------------------------------------------------
+
+A jit-compiled function passed as a first-class function
+(``numba.types.FunctionType``) argument is no longer compiled with the declared
+return type. Previously, the declared return type applied to every later call
+of the function with the same argument types. The function is now compiled for
+the argument types alone. If its return type differs from the declared one, the
+result is converted to the declared type with the conversion a ``return``
+statement performs. The conversion replaces the error added in 0.68.0 for a
+declared return type that does not use the same LLVM value type as the
+function's own return type. An error is still raised if no conversion exists.
