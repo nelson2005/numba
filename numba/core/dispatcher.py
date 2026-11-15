@@ -16,12 +16,39 @@ from numba.core import (
 )
 from numba.core.compiler_lock import global_compiler_lock
 from numba.core.typeconv.rules import default_type_manager
-from numba.core.typing.templates import fold_arguments
+from numba.core.typing.templates import (
+    fold_arguments, infer_global, AbstractTemplate)
+from numba.core.imputils import lower_builtin, user_function
 from numba.core.typing.typeof import Purpose, typeof
 from numba.core.bytecode import get_code_object
 from numba.core.caching import NullCache, FunctionCache
 from numba.core import entrypoints
 import numba.core.event as ev
+
+
+def _call_overload(dispatcher_type, *args):
+    """Call the overload that a dispatcher has for the types of *args*.
+
+    Only the adapters compiled by ``Dispatcher._get_return_adapter`` call this
+    function. They pass the dispatcher's Numba type, which holds only a weak
+    reference to the dispatcher, so an adapter does not keep it alive. Calling
+    the dispatcher itself would bind the arguments to its parameters again.
+    """
+
+
+@infer_global(_call_overload)
+class _CallOverload(AbstractTemplate):
+    def generic(self, args, kws):
+        overload = args[0].instance_type.dispatcher.overloads[args[1:]]
+        return typing.signature(overload.signature.return_type, *args)
+
+
+@lower_builtin(_call_overload, types.TypeRef, types.VarArg(types.Any))
+def _lower_call_overload(context, builder, sig, args):
+    overload = sig.args[0].instance_type.dispatcher.overloads[sig.args[1:]]
+    context.add_linking_libs([overload.library])
+    call = user_function(overload.fndesc, ())
+    return call(context, builder, overload.signature, args[1:])
 
 
 class OmittedArg(object):
@@ -203,10 +230,6 @@ class _DispatcherBase(_dispatcher.Dispatcher):
         # A mapping of (args, return_type) to the compile results of the
         # adapters made by get_compile_result(). They are not overloads.
         self._return_adapters = {}
-        # The (args, return_type) pairs requested from get_compile_result().
-        # recompile() ranks the first-class function type for each pair
-        # again.
-        self._declared_signatures = set()
 
         self.py_func = py_func
         # other parts of Numba assume the old Python 2 name for code object
@@ -960,7 +983,6 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
         _, return_type = sigutils.normalize_signature(sig)
         if return_type is None or not return_type.is_precise():
             return cres
-        self._declared_signatures.add((atypes, return_type))
         actual = cres.signature.return_type
         if actual == return_type:
             return cres
@@ -971,10 +993,6 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
                 self.targetctx.get_value_type(actual) ==
                 self.targetctx.get_value_type(return_type)):
             return cres
-        # Overloads are keyed by argument types alone, so a second overload
-        # with the declared return type cannot be registered. Convert the
-        # return value in an adapter instead (see
-        # https://github.com/numba/numba/issues/10755).
         return self._get_return_adapter(atypes, return_type)
 
     def _get_return_adapter(self, args, return_type):
@@ -984,8 +1002,8 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
         value.
 
         Adapters are kept apart from ``self.overloads``: they take no part
-        in dispatch and are not saved to the on-disk cache. An adapter does
-        not add a new signature, so it is compiled even when
+        in dispatch and are not saved to the on-disk cache. An adapter is
+        not a signature of the function, so it is compiled even when
         ``disable_compile`` has disabled the compilation of new signatures.
 
         Raises ``TypingError`` if the return type cannot be converted.
@@ -998,36 +1016,29 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
             cres = self._return_adapters.get(key)
             if cres is not None:
                 return cres
+            overload = self.overloads[args]
+            actual = overload.signature.return_type
+            if self.typingctx.can_convert(actual, return_type) is None:
+                msg = f"mismatch of return type: {actual} vs {return_type}"
+                raise errors.TypingError(msg)
             names = ', '.join(f'arg{i}' for i in range(len(args)))
-            glbls = {'callee': self}
-            exec(f'def adapter({names}):\n    return callee({names})\n',
-                 glbls)
+            glbls = {'call': _call_overload, 'callee': types.Dispatcher(self)}
+            exec(f'def adapter({names}):\n'
+                 f'    return call(callee, {names})\n', glbls)
             adapter = glbls['adapter']
-            adapter.__module__ = self.py_func.__module__
-            # The symbol name is derived from the qualified name. Including
-            # the return type keeps two adapters of one overload apart, even
-            # when a copy of one comes from the on-disk cache of a caller.
-            adapter.__qualname__ = (f'{self.py_func.__qualname__}.'
+            # Include the overload's symbol name so that a copy of the adapter
+            # in a caller's on-disk cache does not match an adapter for another
+            # overload.
+            adapter.__qualname__ = (f'{overload.fndesc.mangled_name}.'
                                     f'<adapter {return_type}>')
             flags = compiler.Flags()
             flags.nrt = True
             flags.no_cfunc_wrapper = self.targetoptions.get(
                 'no_cfunc_wrapper', False)
-            try:
-                cres = compiler.compile_extra(self.typingctx, self.targetctx,
-                                              adapter, args=args,
-                                              return_type=return_type,
-                                              flags=flags, locals={})
-            except errors.TypingError as e:
-                # The adapter is a call plus a cast; only the cast can fail
-                actual = self.overloads[args].signature.return_type
-                msg = f"mismatch of return type: {actual} vs {return_type}"
-                raise errors.TypingError(msg) from e
-            # The IR and the globals of the adapter refer to this
-            # dispatcher. Drop them: the finalizer holds the adapters, so a
-            # reference back would keep the dispatcher alive.
-            glbls.clear()
-            cres = cres._replace(type_annotation=None)
+            cres = compiler.compile_extra(self.typingctx, self.targetctx,
+                                          adapter, args=args,
+                                          return_type=return_type,
+                                          flags=flags, locals={})
             self._return_adapters[key] = cres
             return cres
 
@@ -1048,17 +1059,6 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
                 self.compile(sig)
         finally:
             self._can_compile = old_can_compile
-        # The type manager caches the rank of this dispatcher for each
-        # first-class function type. The rank depends on the return type of
-        # an overload, which may have changed.
-        typ = types.Dispatcher(self)
-        tm = self.typingctx.tm
-        for args, return_type in list(self._declared_signatures):
-            target = types.FunctionType(return_type(*args))
-            if tm.check_compatible(typ, target) is not None:
-                conv = typ.can_convert_to(self.typingctx, target)
-                if conv is not None:
-                    tm.set_compatible(typ, target, conv)
 
     @property
     def stats(self):

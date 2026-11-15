@@ -198,9 +198,7 @@ declared signature is expected is compiled for the argument types of that
 signature. If the function returns a different type, its result is converted
 to the declared return type, as a ``return`` statement converts a value, and
 an error is raised if no such conversion exists. The function keeps its own
-return type for every other caller. When the other arguments match equally
-well, overload resolution prefers a ``types.FunctionType`` signature whose
-return type matches the function's own over one that needs the conversion.
+return type for every other caller.
 
 
 Wrapper Address Protocol - WAP

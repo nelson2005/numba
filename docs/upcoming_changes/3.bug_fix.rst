@@ -9,4 +9,12 @@ the argument types alone. If its return type differs from the declared one, the
 result is converted to the declared type with the conversion a ``return``
 statement performs. The conversion replaces the error added in 0.68.0 for a
 declared return type that does not use the same LLVM value type as the
-function's own return type. An error is still raised if no conversion exists.
+function's own return type. Numba raises an error if no conversion exists. This
+now includes a declared return type that only shares an LLVM value type with
+the function's own return type, such as ``datetime64[ms]`` for a function that
+returns ``datetime64[s]``. Earlier versions accepted such a function once it
+was compiled, and read its result as the declared type. If the receiving
+function has two signatures that differ only in the declared return type of
+that argument, both can match. As before 0.68.0, a call from Python then raises
+``Ambiguous overloading``, and compiled code takes the signature declared
+first.
