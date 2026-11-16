@@ -1628,12 +1628,30 @@ class TestFunctionTypeReturnMismatch(TestCase):
         gm(1)
         cres = gm.get_compile_result(float64(int64))
         self.assertEqual(cres.signature, float64(int64))
+        for sig in (float32(int64), float32(float64)):
+            self.assertEqual(gm.get_compile_result(sig).signature, sig)
         self.assertIn(gm.overloads[(int64,)].fndesc.mangled_name,
                       cres.fndesc.mangled_name)
         self.assertPreciseEqual(cres.entry_point(1), 2.0)
         with self.assertRaises(ValueError) as raises:
             cres.entry_point(-1)
         self.assertEqual(str(raises.exception), "negative")
+
+    def test_array_result(self):
+        # Without NRT an adapter cannot return an array
+        @jit
+        def gm(n):
+            return np.arange(n)
+
+        any_layout = types.Array(int64, 1, 'A')
+
+        @jit((types.FunctionType(any_layout(int64)), int64))
+        def total(fn, n):
+            return fn(n).sum()
+
+        self.assertPreciseEqual(total(gm, 4), 6)
+        self.assertEqual(gm.nopython_signatures,
+                         [types.Array(int64, 1, 'C')(int64)])
 
     def test_literal_return_uses_overload(self):
         @jit

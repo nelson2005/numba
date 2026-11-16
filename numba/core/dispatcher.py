@@ -18,7 +18,7 @@ from numba.core.compiler_lock import global_compiler_lock
 from numba.core.typeconv.rules import default_type_manager
 from numba.core.typing.templates import (
     fold_arguments, infer_global, AbstractTemplate)
-from numba.core.imputils import lower_builtin, user_function
+from numba.core.imputils import lower_builtin
 from numba.core.typing.typeof import Purpose, typeof
 from numba.core.bytecode import get_code_object
 from numba.core.caching import NullCache, FunctionCache
@@ -45,10 +45,9 @@ class _CallOverload(AbstractTemplate):
 
 @lower_builtin(_call_overload, types.TypeRef, types.VarArg(types.Any))
 def _lower_call_overload(context, builder, sig, args):
-    overload = sig.args[0].instance_type.dispatcher.overloads[sig.args[1:]]
-    context.add_linking_libs([overload.library])
-    call = user_function(overload.fndesc, ())
-    return call(context, builder, overload.signature, args[1:])
+    fnty = sig.args[0].instance_type
+    callee_sig = typing.signature(sig.return_type, *sig.args[1:])
+    return context.get_function(fnty, callee_sig)(builder, args[1:])
 
 
 class OmittedArg(object):
@@ -964,10 +963,12 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
 
         The overload for the argument types of *sig* is returned when its
         return type is the return type of *sig*, or is a literal type of
-        that type with the same LLVM value type. Otherwise the result is an
-        adapter with the signature *sig*. The adapter calls that overload
-        and converts the return value. The overload itself is compiled from
-        the argument types alone and is never replaced.
+        that type with the same LLVM value type. It is also returned when
+        *sig* has no return type or a return type that is not precise.
+        Otherwise the result is an adapter with the signature *sig*. The
+        adapter calls that overload and converts the return value. The
+        overload itself is compiled from the argument types alone and is
+        never replaced.
 
         Returns ``CompileResult``.
         Raises ``NumbaError`` if the signature is incompatible.
