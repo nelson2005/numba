@@ -1628,6 +1628,8 @@ class TestFunctionTypeReturnMismatch(TestCase):
         gm(1)
         cres = gm.get_compile_result(float64(int64))
         self.assertEqual(cres.signature, float64(int64))
+        self.assertIn(gm.overloads[(int64,)].fndesc.mangled_name,
+                      cres.fndesc.mangled_name)
         self.assertPreciseEqual(cres.entry_point(1), 2.0)
         with self.assertRaises(ValueError) as raises:
             cres.entry_point(-1)
