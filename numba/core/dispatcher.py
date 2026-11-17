@@ -1028,8 +1028,8 @@ class Dispatcher(serialize.ReduceMixin, _MemoMixin, _DispatcherBase):
                  f'    return call(callee, {names})\n', glbls)
             adapter = glbls['adapter']
             # Include the overload's symbol name so that a copy of the adapter
-            # in a caller's on-disk cache does not match an adapter for another
-            # overload.
+            # in a caller's on-disk cache does not match an adapter for an
+            # overload with another symbol name.
             adapter.__qualname__ = (f'{overload.fndesc.mangled_name}.'
                                     f'<adapter {return_type}>')
             flags = compiler.Flags()

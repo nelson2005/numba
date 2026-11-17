@@ -11,6 +11,7 @@ from numba import jit, njit, cfunc, types, int64, float64, float32, errors
 from numba import literal_unroll, typeof
 from numba.core.compiler_lock import global_compiler_lock
 from numba.core.config import IS_WIN32
+from numba.core.typing import signature
 import ctypes
 import warnings
 
@@ -1636,6 +1637,20 @@ class TestFunctionTypeReturnMismatch(TestCase):
         with self.assertRaises(ValueError) as raises:
             cres.entry_point(-1)
         self.assertEqual(str(raises.exception), "negative")
+
+    def test_no_precise_return_type(self):
+        # get_compile_result returns the overload itself for a signature with
+        # no return type, or with a return type that is not precise
+        @jit
+        def gm(x):
+            return x + 1
+
+        gm(1)
+        overload = gm.overloads[(int64,)]
+        for return_type in (None, types.undefined):
+            with self.subTest(return_type=return_type):
+                sig = signature(return_type, int64)
+                self.assertIs(gm.get_compile_result(sig), overload)
 
     def test_array_result(self):
         # Without NRT an adapter cannot return an array
