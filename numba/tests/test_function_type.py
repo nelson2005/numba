@@ -1,14 +1,21 @@
+import gc
+import os
 import re
+import subprocess
 import sys
+import threading
 import unittest
 import types as pytypes
+import weakref
 from numba import jit, njit, cfunc, types, int64, float64, float32, errors
 from numba import literal_unroll, typeof
+from numba.core.compiler_lock import global_compiler_lock
 from numba.core.config import IS_WIN32
+from numba.core.typing import signature
 import ctypes
 import warnings
 
-from .support import TestCase, MemoryLeakMixin
+from .support import TestCase, MemoryLeakMixin, temp_directory
 from .support import redirect_c_stderr, captured_stderr
 
 import numpy as np
@@ -1445,8 +1452,10 @@ class TestFunctionTypeReturnMismatch(TestCase):
             return len(r), r == "hello", r == ""
 
         self.assertEqual(probe(gm), (5, True, False))
+        # The callee keeps its inferred return type
         self.assertEqual(list(gm.nopython_signatures),
-                         [types.unicode_type()])
+                         [types.literal("hello")()])
+        self.assertEqual(gm(), "hello")
 
     def test_literal_int_vs_float64(self):
         @jit
@@ -1458,11 +1467,12 @@ class TestFunctionTypeReturnMismatch(TestCase):
             return fn()
 
         self.assertEqual(probe(gm), 7.0)
-        self.assertEqual(list(gm.nopython_signatures), [float64()])
+        # The callee keeps its inferred return type
+        self.assertEqual(list(gm.nopython_signatures), [types.literal(7)()])
+        self.assertPreciseEqual(gm(), 7)
 
-    def test_preexisting_literal_str_mismatch(self):
-        # Pre-existing () -> Literal[str] overload is keyed by args only,
-        # so compile(sig) does not replace it, mismatch must raise.
+    def test_preexisting_literal_str(self):
+        # A pre-existing () -> Literal[str] overload is converted as well
         @jit
         def gm():
             return "hello"
@@ -1474,9 +1484,451 @@ class TestFunctionTypeReturnMismatch(TestCase):
             r = fn()
             return len(r), r == "hello", r == ""
 
+        self.assertEqual(probe(gm), (5, True, False))
+        self.assertEqual(list(gm.nopython_signatures),
+                         [types.literal("hello")()])
+        self.assertEqual(gm(), "hello")
+
+    def test_callee_keeps_return_type(self):
+        # A declared return type converts the value for that caller only.
+        # The callee serves every other caller with its inferred type, in
+        # either order of first use.
+        big = 2 ** 53
+
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        @jit((types.FunctionType(int64(int64)), int64))
+        def as_int64(fn, x):
+            return fn(x)
+
+        for first, second in [(as_float64, as_int64),
+                              (as_int64, as_float64)]:
+            with self.subTest(first=first.py_func.__name__):
+                @jit
+                def gm(x):
+                    return x + 1
+
+                expected = {as_float64: float(big + 1), as_int64: big + 1}
+                self.assertPreciseEqual(first(gm, big), expected[first])
+                self.assertPreciseEqual(gm(big), big + 1)
+                self.assertPreciseEqual(second(gm, big), expected[second])
+                self.assertEqual(list(gm.nopython_signatures),
+                                 [int64(int64)])
+                self.assertPreciseEqual(gm(big), big + 1)
+
+    def test_direct_call_and_declared_return(self):
+        # One caller links the callee and an adapter for it
+        @jit
+        def gm(x):
+            return x + 1
+
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        @jit
+        def both(x):
+            return gm(x), as_float64(gm, x)
+
+        self.assertPreciseEqual(both(2 ** 53), (2 ** 53 + 1, float(2 ** 53)))
+
+    def test_callee_with_several_overloads(self):
+        @jit
+        def gm(x):
+            return x + 1
+
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        self.assertPreciseEqual(gm(1.5), 2.5)
+        self.assertPreciseEqual(as_float64(gm, 1), 2.0)
+        self.assertEqual(list(gm.nopython_signatures),
+                         [float64(float64), int64(int64)])
+
+    def test_compilation_disabled(self):
+        @jit(int64(int64))
+        def gm(x):
+            return x + 1
+
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        self.assertPreciseEqual(as_float64(gm, 1), 2.0)
+        self.assertEqual(list(gm.nopython_signatures), [int64(int64)])
+
+    def test_compilation_disabled_other_arguments(self):
+        @jit(int64(int64))
+        def gm(x):
+            return x + 1
+
+        @jit((types.FunctionType(float64(float64)), float64))
+        def as_float64(fn, x):
+            return fn(x)
+
         with self.assertRaises(TypeError) as raises:
-            probe(gm)
-        self.assertIn("mismatch of return type", str(raises.exception))
+            as_float64(gm, 1.0)
+        self.assertIn("not available and compilation disabled",
+                      str(raises.exception))
+        self.assertEqual(list(gm.nopython_signatures), [int64(int64)])
+
+    def test_unconvertible_return(self):
+        @jit
+        def gm(x):
+            return x + 1
+
+        @jit((types.FunctionType(types.unicode_type(int64)), int64))
+        def as_str(fn, x):
+            return fn(x)
+
+        for warm in (False, True):
+            with self.subTest(warm=warm):
+                with self.assertRaises(TypeError) as raises:
+                    as_str(gm, 1)
+                self.assertIn("mismatch of return type: int64 vs "
+                              "unicode_type", str(raises.exception))
+                self.assertPreciseEqual(gm(1), 2)
+
+    def test_two_accepting_signatures(self):
+        big = 2 ** 53 + 2
+
+        @jit([float64(types.FunctionType(float64(int64)), int64),
+              int64(types.FunctionType(int64(int64)), int64)])
+        def call(fn, x):
+            return fn(x)
+
+        for warm in (False, True):
+            with self.subTest(warm=warm):
+                @jit
+                def gm(x):
+                    return x + 1
+
+                @jit
+                def outer(x):
+                    return call(gm, x)
+
+                if warm:
+                    gm(1)
+                with self.assertRaises(TypeError) as raises:
+                    call(gm, big)
+                self.assertIn("Ambiguous overloading", str(raises.exception))
+                self.assertPreciseEqual(outer(big), float(big + 1))
+                self.assertEqual(list(gm.nopython_signatures),
+                                 [int64(int64)])
+
+    def test_adapter_entry_point(self):
+        @jit
+        def gm(x):
+            if x < 0:
+                raise ValueError("negative")
+            return x + 1
+
+        gm(1)
+        cres = gm.get_compile_result(float64(int64))
+        self.assertEqual(cres.signature, float64(int64))
+        for sig in (float32(int64), float32(float64)):
+            self.assertEqual(gm.get_compile_result(sig).signature, sig)
+        self.assertIn(gm.overloads[(int64,)].fndesc.mangled_name,
+                      cres.fndesc.mangled_name)
+        self.assertPreciseEqual(cres.entry_point(1), 2.0)
+        with self.assertRaises(ValueError) as raises:
+            cres.entry_point(-1)
+        self.assertEqual(str(raises.exception), "negative")
+
+    def test_no_precise_return_type(self):
+        # get_compile_result returns the overload itself for a signature with
+        # no return type, or with a return type that is not precise
+        @jit
+        def gm(x):
+            return x + 1
+
+        gm(1)
+        overload = gm.overloads[(int64,)]
+        for return_type in (None, types.undefined):
+            with self.subTest(return_type=return_type):
+                sig = signature(return_type, int64)
+                self.assertIs(gm.get_compile_result(sig), overload)
+
+    def test_array_result(self):
+        # Without NRT an adapter cannot return an array
+        @jit
+        def gm(n):
+            return np.arange(n)
+
+        any_layout = types.Array(int64, 1, 'A')
+
+        @jit((types.FunctionType(any_layout(int64)), int64))
+        def total(fn, n):
+            return fn(n).sum()
+
+        self.assertPreciseEqual(total(gm, 4), 6)
+        self.assertEqual(gm.nopython_signatures,
+                         [types.Array(int64, 1, 'C')(int64)])
+
+    def test_literal_return_uses_overload(self):
+        @jit
+        def gm():
+            return 7
+
+        cres = gm.get_compile_result(int64())
+        self.assertIs(cres, gm.overloads[()])
+        self.assertEqual(cres.signature, types.literal(7)())
+
+    def test_adapter_through_first_class_call(self):
+        @jit
+        def gm(x):
+            return x + 1
+
+        inner = types.FunctionType(float64(int64))
+
+        @jit((inner, int64))
+        def apply(fn, x):
+            return fn(x)
+
+        @jit((types.FunctionType(float64(inner, int64)), int64))
+        def higher(h, x):
+            return h(gm, x)
+
+        self.assertPreciseEqual(higher(apply, 3), 4.0)
+
+    def test_star_parameter(self):
+        pair = types.UniTuple(int64, 2)
+
+        @jit
+        def gm(x, *rest):
+            return x + len(rest)
+
+        @jit((types.FunctionType(int64(int64, pair)), int64, pair))
+        def as_int64(fn, x, rest):
+            return fn(x, rest)
+
+        @jit((types.FunctionType(float64(int64, pair)), int64, pair))
+        def as_float64(fn, x, rest):
+            return fn(x, rest)
+
+        self.assertPreciseEqual(as_int64(gm, 10, (5, 6)), 12)
+        self.assertPreciseEqual(as_float64(gm, 10, (5, 6)), 12.0)
+        self.assertPreciseEqual(gm(10, 5, 6), 12)
+
+    def test_one_value_per_parameter(self):
+        # A slot passes one value for each parameter, regardless of the
+        # parameter's kind
+        def star(x, *rest):
+            return x + rest
+
+        def keywords(x, **kw):
+            return x + kw
+
+        @jit((types.FunctionType(float64(int64, int64)), int64, int64))
+        def as_float64(fn, x, y):
+            return fn(x, y)
+
+        for pyfunc in (star, keywords):
+            with self.subTest(pyfunc=pyfunc.__name__):
+                self.assertPreciseEqual(as_float64(jit(pyfunc), 3, 5), 8.0)
+
+    def test_inlined_callee(self):
+        @jit(inline='always', error_model='numpy')
+        def gm(x):
+            return 1.0 / x
+
+        @jit((types.FunctionType(types.complex128(int64)), int64))
+        def as_complex(fn, x):
+            return fn(x)
+
+        self.assertPreciseEqual(as_complex(gm, 0), complex(np.inf))
+
+    def test_same_representation(self):
+        # These two types share an LLVM value type and have no conversion
+        seconds = types.NPDatetime('s')
+        millis = types.NPDatetime('ms')
+
+        @jit((types.FunctionType(millis(seconds)), seconds))
+        def as_millis(fn, x):
+            return fn(x)
+
+        for warm in (False, True):
+            with self.subTest(warm=warm):
+                @jit
+                def gm(x):
+                    return x
+
+                value = np.datetime64(1, 's')
+                if warm:
+                    gm(value)
+                with self.assertRaises(TypeError) as raises:
+                    as_millis(gm, value)
+                self.assertIn("mismatch of return type: datetime64[s] vs "
+                              "datetime64[ms]", str(raises.exception))
+
+    def test_recompile_drops_adapters(self):
+        k = 1
+
+        @jit
+        def gm(x):
+            return x + k
+
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        self.assertPreciseEqual(as_float64(gm, 1), 2.0)
+        k = 10
+        gm.recompile()
+        self.assertPreciseEqual(gm(1), 11)
+        self.assertPreciseEqual(as_float64(gm, 1), 11.0)
+
+    def test_finalizer_removes_adapters(self):
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        def make():
+            @jit
+            def gm(x):
+                return x + 1
+            return gm
+
+        self.assertPreciseEqual(as_float64(make(), 1), 2.0)
+        gc.collect()
+        defns = as_float64.targetctx._defns
+        before = len(defns)
+        gm = make()
+        self.assertPreciseEqual(as_float64(gm, 1), 2.0)
+        self.assertGreater(len(defns), before)
+        cres = gm.overloads[(int64,)]
+        refs = [weakref.ref(obj)
+                for obj in (gm, cres.environment, cres.library)]
+        del gm, cres
+        gc.collect()
+        self.assertEqual([ref() for ref in refs], [None, None, None])
+        self.assertEqual(len(defns), before)
+
+    def test_adapter_lookup_and_compiler_lock(self):
+        @jit
+        def gm(x):
+            return x + 1
+
+        gm(1)
+        sig = float64(int64)
+        found = []
+
+        def lookup():
+            found.append(gm.get_compile_result(sig))
+
+        # A thread that asks for an adapter while another thread compiles
+        # it receives that same adapter
+        thread = threading.Thread(target=lookup)
+        with global_compiler_lock:
+            thread.start()
+            cres = gm.get_compile_result(sig)
+        thread.join()
+        self.assertIs(found[0], cres)
+        # An existing adapter is returned without the compiler lock
+        thread = threading.Thread(target=lookup)
+        with global_compiler_lock:
+            thread.start()
+            thread.join(timeout=60)
+            waited = thread.is_alive()
+        thread.join()
+        self.assertFalse(waited)
+        self.assertIs(found[1], cres)
+
+    def test_no_cfunc_wrapper(self):
+        @jit(no_cfunc_wrapper=True)
+        def gm(x):
+            return x + 1
+
+        @jit((types.FunctionType(int64(int64)), int64))
+        def as_int64(fn, x):
+            return fn(x)
+
+        @jit((types.FunctionType(float64(int64)), int64))
+        def as_float64(fn, x):
+            return fn(x)
+
+        for caller in (as_int64, as_float64):
+            with self.subTest(caller=caller.py_func.__name__):
+                with self.assertRaises(ValueError) as raises:
+                    caller(gm, 1)
+                self.assertIn("wrapper address", str(raises.exception))
+
+
+class TestFunctionTypeAdapterCache(TestCase):
+    # A caller compiled with cache=True keeps a copy of each adapter that it
+    # uses. A process that loads the caller replaces the copy with a function
+    # that it already holds under the copy's symbol name. In each process
+    # below, the first adapter is the fourth function compiled, so its symbol
+    # name has the same counter value in both processes.
+    source = """
+import sys
+from numba import jit, types, int64, float64, float32
+
+
+def make_callee(k):
+    @jit
+    def callee(x):
+        return x + k
+    return callee
+
+
+callee_1 = make_callee(1)
+callee_2 = make_callee(2)
+
+
+@jit((types.FunctionType(float64(int64)),))
+def float64_slot(fn):
+    return fn
+
+
+@jit(cache=True)
+def cached_caller(i, x):
+    if i == 0:
+        fn = float64_slot(callee_1)
+    else:
+        fn = float64_slot(callee_2)
+    return fn(x)
+
+
+def check(callee, return_type):
+    @jit((types.FunctionType(return_type(int64)), int64))
+    def caller(fn, x):
+        return fn(x)
+
+    caller(callee, 0)
+    assert cached_caller(0, 3) == 4.0
+    assert cached_caller.stats.cache_hits
+
+
+if sys.argv[1] == 'fill':
+    assert cached_caller(0, 3) == 4.0
+elif sys.argv[1] == 'same_named_callee':
+    callee = make_callee(100)
+    # Compiling it before its caller gives it a symbol name unlike callee_1's.
+    callee(0)
+    check(callee, float64)
+else:
+    check(callee_1, float32)
+"""
+
+    def check(self, scenario):
+        script = os.path.join(temp_directory('test_function_type'),
+                              'cached_caller.py')
+        with open(script, 'w') as f:
+            f.write(self.source)
+        for arg in ('fill', scenario):
+            proc = subprocess.run([sys.executable, script, arg],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_same_named_callee(self):
+        self.check('same_named_callee')
+
+    def test_other_return_type(self):
+        self.check('other_return_type')
 
 
 if __name__ == '__main__':
